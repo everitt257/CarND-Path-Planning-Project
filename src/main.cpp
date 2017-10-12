@@ -5,9 +5,14 @@
 #include <iostream>
 #include <thread>
 #include <vector>
-#include "Eigen-3.3/Eigen/Core"
-#include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "Car.h"
+#include "Interpolate.h"
+#include "JMT.h"
+#include "helper.h"
+#include "FSM.h"
+#include "Planner.h"
+#include "Eigen-3.3/Eigen/Dense"
 
 using namespace std;
 
@@ -38,7 +43,7 @@ double distance(double x1, double y1, double x2, double y2)
 {
 	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
 }
-int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
+int ClosestWaypoint(double x, double y, vector<double> maps_x, vector<double> maps_y)
 {
 
 	double closestLen = 100000; //large number
@@ -61,7 +66,7 @@ int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vect
 
 }
 
-int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+int NextWaypoint(double x, double y, double theta, vector<double> maps_x, vector<double> maps_y)
 {
 
 	int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
@@ -83,7 +88,7 @@ int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x,
 }
 
 // Transform from Cartesian x,y coordinates to Frenet s,d coordinates
-vector<double> getFrenet(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+vector<double> getFrenet(double x, double y, double theta, vector<double> maps_x, vector<double> maps_y)
 {
 	int next_wp = NextWaypoint(x,y, theta, maps_x,maps_y);
 
@@ -132,7 +137,7 @@ vector<double> getFrenet(double x, double y, double theta, const vector<double> 
 }
 
 // Transform from Frenet s,d coordinates to Cartesian x,y
-vector<double> getXY(double s, double d, const vector<double> &maps_s, const vector<double> &maps_x, const vector<double> &maps_y)
+vector<double> getXY(double s, double d, vector<double> maps_s, vector<double> maps_x, vector<double> maps_y)
 {
 	int prev_wp = -1;
 
@@ -161,42 +166,13 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 int main() {
   uWS::Hub h;
+  Interpolate Interpolater;
+  FSM car_state;
+  bool begin = true;
+  vector<double> s_last_state = {0,0,0};
+  vector<double> d_last_state = {0,0,0};
 
-  // Load up map values for waypoint's x,y,s and d normalized normal vectors
-  vector<double> map_waypoints_x;
-  vector<double> map_waypoints_y;
-  vector<double> map_waypoints_s;
-  vector<double> map_waypoints_dx;
-  vector<double> map_waypoints_dy;
-
-  // Waypoint map to read from
-  string map_file_ = "../data/highway_map.csv";
-  // The max s value before wrapping around the track back to 0
-  double max_s = 6945.554;
-
-  ifstream in_map_(map_file_.c_str(), ifstream::in);
-
-  string line;
-  while (getline(in_map_, line)) {
-  	istringstream iss(line);
-  	double x;
-  	double y;
-  	float s;
-  	float d_x;
-  	float d_y;
-  	iss >> x;
-  	iss >> y;
-  	iss >> s;
-  	iss >> d_x;
-  	iss >> d_y;
-  	map_waypoints_x.push_back(x);
-  	map_waypoints_y.push_back(y);
-  	map_waypoints_s.push_back(s);
-  	map_waypoints_dx.push_back(d_x);
-  	map_waypoints_dy.push_back(d_y);
-  }
-
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  h.onMessage([&Interpolater, &begin, &s_last_state, &d_last_state, &car_state](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -209,12 +185,12 @@ int main() {
 
       if (s != "") {
         auto j = json::parse(s);
-        
+
         string event = j[0].get<string>();
-        
+
         if (event == "telemetry") {
           // j[1] is the data JSON object
-          
+
         	// Main car's localization Data
           	double car_x = j[1]["x"];
           	double car_y = j[1]["y"];
@@ -224,9 +200,9 @@ int main() {
           	double car_speed = j[1]["speed"];
 
           	// Previous path data given to the Planner
-          	auto previous_path_x = j[1]["previous_path_x"];
-          	auto previous_path_y = j[1]["previous_path_y"];
-          	// Previous path's end s and d values 
+          	vector<double> previous_path_x = j[1]["previous_path_x"];
+          	vector<double> previous_path_y = j[1]["previous_path_y"];
+          	// Previous path's end s and d values
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
 
@@ -238,6 +214,64 @@ int main() {
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+            Interpolater.Update(car_x, car_y);
+            Car mainCar(100, car_s, car_d, car_speed);
+            mainCar.UpdateLast(s_last_state, d_last_state);
+
+            if(begin){
+              // Generate initial trajectory
+              int n = 225;
+              double T = n*TIME_INCREMENT;
+              vector<double> s_start = {mainCar.s, mainCar.v, 0};
+              vector<double> s_end = {mainCar.s + 40, 20, 0};
+              JMT s_traj(s_start, s_end, T);
+
+              vector<double> d_start = {mainCar.d, 0, 0};
+              vector<double> d_end = {6,0,0};
+              JMT d_traj(d_start, d_end, T);
+
+              vector< vector<double> > XY = Interpolater.generate_pathXY(s_traj, d_traj, n);
+
+              next_x_vals = XY[0];
+              next_y_vals = XY[1];
+              // save last state to use next starting state
+              s_last_state = s_end;
+              d_last_state = d_end;
+              begin = false;
+            }
+            else if(previous_path_x.size() < 10){
+              // Behavior planner, generate new trajectory
+              vector< Car > other_cars;
+              for(int i=0; i<sensor_fusion.size();i++){
+                int temp_id = sensor_fusion[i][0];
+                double temp_s = sensor_fusion[i][5];
+                double temp_d = sensor_fusion[i][6];
+                double temp_vx = sensor_fusion[i][3];
+                double temp_vy = sensor_fusion[i][4];
+                double temp_speed = sqrt(temp_vx*temp_vx + temp_vy*temp_vy);
+                Car detected_car(temp_id, temp_s, temp_d, temp_speed);
+                // Could add some predictions just to be safe.
+                other_cars.push_back(detected_car);
+              }
+              // Adding behavior planner into the code
+              Planner TrajPlanner(car_state, mainCar, other_cars);
+              vector<JMT> traj = TrajPlanner.GenerateTraj();
+              // Interpolate
+              vector< vector<double> > XY = Interpolater.generate_pathXY(traj[0], traj[1], NSTEP);
+              // Concatenate
+              next_x_vals = previous_path_x;
+              next_y_vals = previous_path_y;
+              next_x_vals.insert(next_x_vals.end(), XY[0].begin(), XY[0].end());
+              next_y_vals.insert(next_y_vals.end(), XY[1].begin(), XY[1].end());
+              // Save last state
+              s_last_state = TrajPlanner.future_s;
+              d_last_state = TrajPlanner.future_d;
+            }
+            else{
+              // Default behavior, passing unfinished trajectory as future trajectory
+              next_x_vals = previous_path_x;
+              next_y_vals = previous_path_y;
+            }
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	msgJson["next_x"] = next_x_vals;
@@ -247,7 +281,7 @@ int main() {
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+
         }
       } else {
         // Manual driving
